@@ -1,0 +1,12 @@
+[Unit]
+Description=iMac 2019 speaker amplifier enable (GPIO4)
+After=sound.target sys-subsystem-sound-devices-controlC0.device
+Wants=sys-subsystem-sound-devices-controlC0.device
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/imac-speaker-amp.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
