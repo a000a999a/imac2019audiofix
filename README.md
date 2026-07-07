@@ -1,76 +1,103 @@
 # iMac 2019 (iMac19,2) Audio Fix for Linux
 
-Fixes silent speakers on **Apple iMac 21.5" 4K Retina 2019 (iMac19,2)** running Linux (tested on Manjaro, kernel 6.12).
+Fixes audio on **Apple iMac 21.5" 4K Retina 2019 (iMac19,2)** running Linux (tested on Manjaro, kernel 6.18).
+
+There have been two, unrelated bugs in this machine's Linux audio history. This repo documents both,
+including a corrected understanding of the second one after an earlier fix turned out to be wrong.
 
 ## Quick Install
 
 ```bash
-git clone https://github.com/a000a999a/imac2019audio.git
-cd imac2019audio
-bash install.sh
+git clone git@github.com:a000a999a/imac2019audiofix.git
+cd imac2019audiofix
+sudo ./install.sh
 reboot
 ```
 
-## The Problem
+**Prerequisite:** you need the patched `snd-hda-codec-cs8409` driver from
+[davidjo/snd_hda_macbookpro](https://github.com/davidjo/snd_hda_macbookpro) installed first
+(`sudo ./install.cirrus.driver.sh` from that repo, then reboot once before running `install.sh` here).
+The stock/mainline kernel driver's Cirrus CS8409 support is not sufficient for this hardware.
 
-Two separate bugs prevent audio from working out of the box:
+## Bug 1 — Speaker amp stays in shutdown (GPIO4)
 
-### Bug 1 — CS42L42 sub-codecs never initialized
+The iMac's **Cirrus Logic CS8409** HDA bridge drives a **TAS5770L** speaker amplifier. The amp's enable
+pin is wired to the codec's **GPIO4**, which is left as an input (LOW) by default — the amp never comes
+out of hardware shutdown, so internal speakers are silent (headphones are unaffected; they don't go
+through this amp).
 
-The iMac uses a **Cirrus Logic CS8409** HDA bridge chip which talks to two **CS42L42** amplifier chips over I2C. The Linux kernel's CS8409 driver has a "Dolphin" fixup that initializes these chips, but it only fires when the PCI subsystem ID is `0x106b:xxxx` (Apple vendor). On this iMac, the Intel HDA controller reports subsystem `0x8086:0x7270` (Intel generic), so the quirk never matches and the CS42L42 chips stay uninitialized → complete silence.
+**Fix:** an HDA firmware "patch" file (`imac2019-gpio4.fw`) that sets GPIO4 (and GPIO1/GPIO5) HIGH via
+init verbs at codec-init time, loaded through the `patch=` modprobe option — no separate script or
+service required.
 
-**Fix:** Force the Dolphin fixup by name via modprobe option.
+## Bug 2 — Forcing `model=dolphin` badly over-amplifies and distorts audio
 
-### Bug 2 — Speaker amplifier stays in shutdown
+An earlier version of this fix (see git history) forced `model=dolphin` to get the CS8409 driver
+initializing anything at all under the stock kernel driver. **This was wrong and is not recommended.**
 
-Even after Bug 1 is fixed, internal speakers remain silent. The Dolphin fixup drives GPIO1 (CS42L42 C1 reset) and GPIO5 (CS42L42 C0 reset) HIGH, but leaves **GPIO4** as an input (LOW). GPIO4 is the enable pin for the speaker amplifier. With it LOW, the amp stays in hardware shutdown.
+`dolphin` selects the `CS8409_DOLPHIN` fixup, which is for the **Dell Inspiron "Dolphin"** platform — a
+different vendor, different amp, different I2C init register sequences. Forcing it onto this iMac's
+TAS5770L applies Dell's amp-gain I2C init values, not Apple's. Confirmed by direct signal analysis: with
+`model=dolphin` forced, true digital silence played completely silent, but a clean low-level tone came
+out loud and distorted at the speaker — i.e. real over-amplification happening in the analog stage,
+downstream of anything ALSA/PipeWire volume controls can reach.
 
-Headphones are unaffected (they go through the CS42L42 directly).
+**Fix:** don't force `dolphin`. In practice, forcing `model=mbp143` also works and is what's currently
+deployed — but note this is **not** because `mbp143`/`CS8409_MBP143` is an active Apple/iMac fixup in
+this driver build. It's dead code: the entire `CS8409_MBP143` quirk table in
+`patch_cirrus/patch_cirrus_apple.h` is guarded by `#ifdef APPLE_FIXUPS`, and `APPLE_FIXUPS` is never
+defined anywhere in this driver's Makefile/build — it's explicitly marked in the source as legacy code
+kept "for reference." The real compiled model table (`cs8409-tables.c`) only recognizes Dell model names
+(`bullseye`, `warlock`, `cyborg`, `dolphin`, `odin`, etc.) — no iMac/MacBookPro entry exists at all.
 
-**Fix:** A systemd oneshot service drives GPIO4 HIGH after the sound card loads.
+So `model=mbp143` works simply because it's an **unrecognized string**: the driver can't match it to any
+compiled fixup, silently skips forced model selection, and falls through to generic HDA auto-configuration
+instead of forcibly applying Dolphin's wrong Dell I2C amp-init sequence. Omitting `model=` entirely would
+very likely produce the same result, but that hasn't been tested on this machine — `model=mbp143` is
+what's confirmed working, so that's what's documented and installed here.
+
+## Current Confirmed Configuration
+
+`/etc/modprobe.d/50-sound.conf`:
+```
+options snd-intel-dspcfg dsp_driver=1
+options snd-hda-intel model=mbp143 patch=imac2019-gpio4.fw power_save=0
+```
+
+Verified end-to-end: real hardware sink (`alsa_output.pci-0000_00_1f.3.analog-stereo`) plays cleanly at
+both low and high volume via `speaker-test`, and via real playback (VLC) with live volume changes — no
+distortion, fully controllable. No PipeWire DSP volume workaround is needed.
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `imac-speaker-amp.sh` | Sets GPIO4 HIGH on the HDA Audio Function Group (NID 0x01) |
-| `imac-speaker-amp.service` | systemd unit that runs the script at boot |
-| `install.sh` | Automated installer for both fixes |
+| `imac2019-gpio4.fw` | HDA patch firmware: sets GPIO4 (speaker amp enable) + GPIO1/GPIO5 at codec init |
+| `install.sh` | Installs the modprobe config and firmware patch file |
+| `imac-speaker-amp.sh` / `.service` | **Legacy fallback** — a systemd oneshot that sets the same GPIO bits via `hda-verb` after boot, for use without the firmware `patch=` mechanism (e.g. plain mainline kernel). Not installed by `install.sh`; kept for reference. |
 
 ## Manual Install
 
-### Fix 1 — modprobe config
-
-Add to `/etc/modprobe.d/50-sound.conf`:
-
-```
-options snd-intel-dspcfg dsp_driver=1
-options snd-hda-intel model=dolphin
-```
-
-Reboot (or `sudo modprobe -r snd-hda-intel && sudo modprobe snd-hda-intel`).
-
-### Fix 2 — GPIO4 speaker amp
-
 ```bash
-sudo cp imac-speaker-amp.sh /usr/local/bin/imac-speaker-amp.sh
-sudo chmod +x /usr/local/bin/imac-speaker-amp.sh
-sudo cp imac-speaker-amp.service /etc/systemd/system/imac-speaker-amp.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now imac-speaker-amp.service
+sudo cp imac2019-gpio4.fw /lib/firmware/imac2019-gpio4.fw
+sudo tee /etc/modprobe.d/50-sound.conf <<'EOF'
+options snd-intel-dspcfg dsp_driver=1
+options snd-hda-intel model=mbp143 patch=imac2019-gpio4.fw power_save=0
+EOF
+sudo reboot
 ```
 
 ### Verify
 
 ```bash
-# CS42L42 init messages (requires Fix 1 + reboot)
-sudo dmesg | grep -iE "dolphin|cs42l42|sub_codec"
+# Confirm the patched driver loaded (not the stock kernel one)
+modinfo snd-hda-codec-cs8409 | grep filename
 
-# GPIO4 service status
-systemctl status imac-speaker-amp.service
+# Confirm the model parameter took
+cat /sys/module/snd_hda_intel/parameters/model
 
-# Audio test
-speaker-test -D default -c 2 -t sine -f 440 -l 1
+# Audio test — try at low volume first
+speaker-test -c 2 -t sine -f 440 -l 1
 ```
 
 ## Hardware Details
@@ -79,19 +106,8 @@ speaker-test -D default -c 2 -t sine -f 440 -l 1
 |-----------|--------|
 | Machine | Apple iMac19,2 (21.5" 4K Retina, 2019) |
 | HDA controller | Intel Cannon Lake PCH cAVS (`0x8086:a348`) |
-| HDA subsystem | `0x8086:0x7270` (Intel generic — the root of Bug 1) |
-| Codec | Cirrus Logic CS8409 (HDA bridge) |
+| HDA controller subsystem | `0x8086:0x7270` (Intel generic — doesn't match any Dell PCI-subsystem quirk) |
+| Codec | Cirrus Logic CS8409 (vendor ID `0x10138409`) |
 | Codec subsystem | `0x106b:0x0f00` |
-| Sub-codecs | CS42L42 × 2 at I2C 0x49 (speakers) |
-| Speaker amp enable | CS8409 GPIO4 (bit 4, must be driven HIGH) |
-| Dolphin GPIO1 | CS42L42 C1 reset (HIGH) |
-| Dolphin GPIO5 | CS42L42 C0 reset (HIGH) |
-
-## GPIO Bitmask Reference
-
-```
-0x02 = GPIO1  (CS42L42 C1 reset — set by Dolphin)
-0x10 = GPIO4  (speaker amp enable — THIS fix)
-0x20 = GPIO5  (CS42L42 C0 reset — set by Dolphin)
-0x32 = GPIO1 + GPIO4 + GPIO5  (full correct state)
-```
+| Speaker amp | TAS5770L, I2C-controlled, enabled via GPIO4 |
+| GPIO bitmask | `0x32` = GPIO1 (`0x02`) + GPIO4 (`0x10`) + GPIO5 (`0x20`) |
